@@ -262,9 +262,10 @@ class RedisCollector(diamond.collector.Collector):
         if client is None:
             return None
 
-        info = client.info()
+        with Timer() as t:
+            info = client.info()
         del client
-        return info
+        return t.interval, info
 
     def _get_config(self, host, port, unix_socket, auth, config_key):
         """Return config string from specified Redis instance and config key
@@ -296,7 +297,7 @@ class RedisCollector(diamond.collector.Collector):
         """
 
         # Connect to redis and get the info
-        info = self._get_info(host, port, unix_socket, auth)
+        latency, info = self._get_info(host, port, unix_socket, auth)
         if info is None:
             return
 
@@ -355,6 +356,9 @@ class RedisCollector(diamond.collector.Collector):
             if key in info:
                 data['last_save.time_since'] = int(time.time()) - info[key]
 
+        # Add in the latency
+        data['latency'] = latency / 1000  # divide to get milliseconds
+
         # Publish the data to graphite
         for key in data:
             self.publish(self._publish_key(nick, key),
@@ -373,3 +377,13 @@ class RedisCollector(diamond.collector.Collector):
         for nick in self.instances.keys():
             (host, port, unix_socket, auth) = self.instances[nick]
             self.collect_instance(nick, host, int(port), unix_socket, auth)
+
+
+class Timer(object):
+    def __enter__(self):
+        self.start = time.clock()
+        return self
+
+    def __exit__(self, *args):
+        self.end = time.clock()
+        self.interval = self.end - self.start
