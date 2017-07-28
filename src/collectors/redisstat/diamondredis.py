@@ -9,11 +9,6 @@ Collects data from one or more Redis Servers
 
 #### Notes
 
-The collector is named an odd redisstat because of an import issue with
-having the python library called redis and this collector's module being called
-redis, so we use an odd name for this collector. This doesn't affect the usage
-of this collector.
-
 Example config file RedisCollector.conf
 
 ```
@@ -54,6 +49,8 @@ If not specified the port will be used. In case of unix sockets, the base name
 without file extension (i.e. in the aforementioned examples ``redis``)
 is the default metric key.
 
+``check_config`` must be True to check maxmemory. This is off by default because it's not supported by all redis flavors
+like elasticache.
 
 """
 
@@ -332,19 +329,21 @@ class RedisCollector(diamond.collector.Collector):
             else:
                 data['replication.master'] = 0
 
-        # Connect to redis and get the maxmemory config value
-        # Then calculate the % maxmemory of memory used
-        maxmemory_config = self._get_config(client, 'maxmemory')
-        if maxmemory_config and 'maxmemory' in maxmemory_config.keys():
-            maxmemory = float(maxmemory_config['maxmemory'])
+        if self.config.get('check_config', False):
+            # Get the maxmemory config value
+            # Then calculate the % maxmemory of memory used
+            # Disabled by default as it's not supported for all redis instances E.g. Elasticache
+            maxmemory_config = self._get_config(client, 'maxmemory')
+            if maxmemory_config and 'maxmemory' in maxmemory_config.keys():
+                maxmemory = float(maxmemory_config['maxmemory'])
 
-            # Only report % used if maxmemory is a non zero value
-            if maxmemory == 0:
-                maxmemory_percent = 0.0
-            else:
-                maxmemory_percent = info['used_memory'] / maxmemory * 100
-                maxmemory_percent = round(maxmemory_percent, 2)
-            data['memory.used_percent'] = float("%.2f" % maxmemory_percent)
+                # Only report % used if maxmemory is a non zero value
+                if maxmemory == 0:
+                    maxmemory_percent = 0.0
+                else:
+                    maxmemory_percent = info['used_memory'] / maxmemory * 100
+                    maxmemory_percent = round(maxmemory_percent, 2)
+                data['memory.used_percent'] = float("%.2f" % maxmemory_percent)
 
         # Iterate over the top level keys
         for key in self._KEYS:
