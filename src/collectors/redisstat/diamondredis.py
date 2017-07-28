@@ -66,13 +66,11 @@ try:
 except ImportError:
     redis = None
 
-
 SOCKET_PREFIX = 'unix:'
 SOCKET_PREFIX_LEN = len(SOCKET_PREFIX)
 
 
 class RedisCollector(diamond.collector.Collector):
-
     _DATABASE_COUNT = 16
     _DEFAULT_DB = 0
     _DEFAULT_HOST = 'localhost'
@@ -107,6 +105,10 @@ class RedisCollector(diamond.collector.Collector):
     _RENAMED_KEYS = {'last_save.changes_since': 'rdb_changes_since_last_save',
                      'last_save.time': 'rdb_last_save_time'}
 
+    def __init__(self, *args, **kwargs):
+        self.connection_pool = {}
+        super(RedisCollector, self).__init__(*args, **kwargs)
+
     def process_config(self):
         super(RedisCollector, self).process_config()
         instance_list = self.config['instances']
@@ -135,7 +137,7 @@ class RedisCollector(diamond.collector.Collector):
 
             if hostport.startswith(SOCKET_PREFIX):
                 unix_socket, __, port_auth = hostport[
-                    SOCKET_PREFIX_LEN:].partition(':')
+                                             SOCKET_PREFIX_LEN:].partition(':')
                 auth = port_auth.partition('/')[2] or None
 
                 if nickname is None:
@@ -206,7 +208,24 @@ class RedisCollector(diamond.collector.Collector):
         })
         return config
 
-    def _client(self, host, port, unix_socket, auth):
+    def _init_connection(self, nick, host, port, db, unix_socket, auth, timeout):
+        if nick in self.connection_pool:
+            return self.connection_pool[nick]
+
+        try:
+            cli = redis.Redis(host=host, port=port,
+                              db=db, socket_timeout=timeout, password=auth,
+                              unix_socket_path=unix_socket)
+        except Exception, ex:
+            self.log.error("RedisCollector: failed to connect to %s:%i. %s.",
+                           unix_socket or host, port, ex)
+            return None
+
+        self.connection_pool[nick] = cli
+
+        return cli
+
+    def _client(self, nick, host, port, unix_socket, auth):
         """Return a redis client for the configuration.
 
 :param str host: redis host
@@ -214,17 +233,19 @@ class RedisCollector(diamond.collector.Collector):
 :rtype: redis.Redis
 
         """
+
         db = int(self.config['db'])
         timeout = int(self.config['timeout'])
+
         try:
-            cli = redis.Redis(host=host, port=port,
-                              db=db, socket_timeout=timeout, password=auth,
-                              unix_socket_path=unix_socket)
+            cli = self._init_connection(nick, host, port, db, unix_socket, auth, timeout)
             cli.ping()
             return cli
         except Exception, ex:
-            self.log.error("RedisCollector: failed to connect to %s:%i. %s.",
+            self.log.error("RedisCollector: failed to ping %s:%i. %s.",
                            unix_socket or host, port, ex)
+            del self.connection_pool[nick]
+            return None
 
     def _precision(self, value):
         """Return the precision of the number
@@ -249,40 +270,28 @@ class RedisCollector(diamond.collector.Collector):
         """
         return '%s.%s' % (nick, key)
 
-    def _get_info(self, host, port, unix_socket, auth):
+    def _get_info(self, client):
         """Return info dict from specified Redis instance
 
-:param str host: redis host
-:param int port: redis port
+:param redis client: redis client
 :rtype: dict
 
         """
-
-        client = self._client(host, port, unix_socket, auth)
-        if client is None:
-            return None
 
         with Timer() as t:
             info = client.info()
         del client
         return t.interval, info
 
-    def _get_config(self, host, port, unix_socket, auth, config_key):
+    def _get_config(self, client, config_key):
         """Return config string from specified Redis instance and config key
 
-:param str host: redis host
-:param int port: redis port
-:param str host: redis config_key
+:param redis client: redis client
 :rtype: str
 
         """
 
-        client = self._client(host, port, unix_socket, auth)
-        if client is None:
-            return None
-
         config_value = client.config_get(config_key)
-        del client
         return config_value
 
     def collect_instance(self, nick, host, port, unix_socket, auth):
@@ -296,8 +305,13 @@ class RedisCollector(diamond.collector.Collector):
 
         """
 
+        client = self._client(nick, host, port, unix_socket, auth)
+        if not client:
+            return None
+
         # Connect to redis and get the info
-        latency, info = self._get_info(host, port, unix_socket, auth)
+        latency, info = self._get_info(client)
+
         if info is None:
             return
 
@@ -320,8 +334,7 @@ class RedisCollector(diamond.collector.Collector):
 
         # Connect to redis and get the maxmemory config value
         # Then calculate the % maxmemory of memory used
-        maxmemory_config = self._get_config(host, port, unix_socket, auth,
-                                            'maxmemory')
+        maxmemory_config = self._get_config(client, 'maxmemory')
         if maxmemory_config and 'maxmemory' in maxmemory_config.keys():
             maxmemory = float(maxmemory_config['maxmemory'])
 
@@ -357,7 +370,7 @@ class RedisCollector(diamond.collector.Collector):
                 data['last_save.time_since'] = int(time.time()) - info[key]
 
         # Add in the latency
-        data['latency'] = latency / 1000  # divide to get milliseconds
+        data['latency'] = latency * 1000  # multiply to get milliseconds
 
         # Publish the data to graphite
         for key in data:
@@ -381,9 +394,9 @@ class RedisCollector(diamond.collector.Collector):
 
 class Timer(object):
     def __enter__(self):
-        self.start = time.clock()
+        self.start = time.time()
         return self
 
     def __exit__(self, *args):
-        self.end = time.clock()
+        self.end = time.time()
         self.interval = self.end - self.start
